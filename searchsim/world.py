@@ -444,7 +444,7 @@ def main():
     ap.add_argument("--start-window", type=float, default=900, help="node starts spread over this (s)")
     ap.add_argument("--register-wait", type=float, default=1350, help="search phase starts this long after the window (s)")
     ap.add_argument("--search-time", type=float, default=3600)
-    ap.add_argument("--search-stagger", type=float, default=0.1)
+    ap.add_argument("--search-stagger", type=float, default=-1, help="seconds between searcher starts; default spreads the starts over a quarter of the search phase, at most 0.1 s apart")
     ap.add_argument("--target", type=int, default=0, help="conn-driven stop at this many results; 0 = continuous")
     ap.add_argument("--search-frac", type=float, default=1.0, help="fraction of nodes that search (sampled)")
     ap.add_argument("--bootnodes", type=int, default=0)
@@ -468,6 +468,8 @@ def main():
             w.at(float(starts[i]), "start_reg", i, int(pop.topics[i]))
     search_at = a.start_window + a.register_wait
     searchers = [i for i in range(pop.n) if rng.random() < a.search_frac]
+    if a.search_stagger < 0:
+        a.search_stagger = min(0.1, 0.25 * a.search_time / max(1, len(searchers)))
     for j, i in enumerate(searchers):
         w.at(search_at + j * a.search_stagger, "start_search", i, int(pop.topics[i]), a.target, search_at + a.search_time)
     end = search_at + a.search_time
