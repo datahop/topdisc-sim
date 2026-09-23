@@ -79,6 +79,20 @@ arrays needed to draw ID-space figures.
 
 ## Validation
 
+Event-driven model at 10k, 100 crawl topics, connection-driven search for 1 h,
+against the simnet runs of 2026-09-21 (4 h, so per-hour where it matters):
+fan-out 30 to 38 registrars per registrant (measured 36), ads held per
+registrar consistent with the fan-out, queries per search by topic size
+matched including the small-topic re-walkers (51k per hour, measured 46k),
+the adaptive settled buckets within one of the measured ones, registrar
+load median within 2x and p99 within 2x. The default's extreme maximum stays
+about 7x under the measured 715k queries over 4 h: the spawn-order table
+weight reproduces the direction and about a quarter of the measured gradient,
+so the busiest nodes are under-loaded. Quoted waits are lower than measured
+because the IP term is not modelled (the measured runs had it maxed by their
+address scheme).
+
+
 Against the 10k simnet runs of 2026-09-21 (100 crawl topics, 4 h,
 connection-driven): registrar p99 and max relative to the median, queries
 per search by topic size, and the settled bucket per class. Numbers the
