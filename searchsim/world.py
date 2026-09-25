@@ -203,9 +203,10 @@ class WorldConfig(Config):
 
 
 class World:
-    def __init__(self, pop, cfg, rtt, seed, backoff=0.0, sybil=None):
+    def __init__(self, pop, cfg, rtt, seed, backoff=0.0, sybil=None, idle_replies=0):
         self.pop, self.cfg, self.rtt = pop, cfg, rtt
         self.backoff = backoff
+        self.idle_replies = idle_replies
         self.first_found = {}
         # sybil[i]: node i is an attacker. A sybil registrar answers every query
         # with sybil ads of the topic only and hands out sybils as aux nodes;
@@ -393,6 +394,7 @@ class SearcherState:
         self.done = False
         self.idle_passes = 0
         self.new_in_pass = 0
+        self.idle_replies = 0
 
     def pass_gap(self):
         """Minimum gap before the next pass: 2 s, doubling after every pass
@@ -413,6 +415,7 @@ class SearcherState:
         self.st.add_nodes(None, self.seeds, w.now)
         self.passes += 1
         self.pass_start = w.now
+        self.idle_replies = 0
         self.active_trace.append((w.now - self.t0, self.st.active))
 
     def step(self):
@@ -431,6 +434,13 @@ class SearcherState:
         st.results.clear()
         if self.target and len(self.found) >= self.target:
             self.done = True; self.end = w.now; return
+        # end the pass early after --idle-replies replies in a row brought nothing
+        # new, once the searcher holds any result: the walk is not finding ads
+        if w.idle_replies and self.found and self.idle_replies >= w.idle_replies:
+            st.results.clear()
+            self.active = st.active; self.st = None
+            w.at(max(w.now, self.pass_start + self.pass_gap()), "sstep", self.node)
+            return
         if st.is_done() or (dst := st.query_target()) is None:
             self.active = st.active
             self.st = None
@@ -448,7 +458,8 @@ class SearcherState:
             w.at(w.now, "sstep", self.node); return
         st.add_nodes(dst, aux, w.now)
         before = st.active
-        st.add_query_results(dst, results, w.now)
+        new = st.add_query_results(dst, results, w.now)
+        self.idle_replies = 0 if any(int(r) not in self.found for r in results) else self.idle_replies + 1
         if st.active != before:
             self.active_trace.append((w.now - self.t0, st.active))
         w.at(w.now, "sstep", self.node)
@@ -488,6 +499,7 @@ def main():
     ap.add_argument("--target", type=int, default=0, help="conn-driven stop at this many results; 0 = continuous")
     ap.add_argument("--search-frac", type=float, default=1.0, help="fraction of nodes that search (sampled)")
     ap.add_argument("--pass-backoff", type=float, default=0, help="cap (s) of the exponential gap between passes that found nothing new; 0 = fixed 2 s")
+    ap.add_argument("--idle-replies", type=int, default=0, help="end a pass after this many consecutive replies with nothing new; 0 = walk the whole table")
     ap.add_argument("--late-frac", type=float, default=0, help="fraction of registrants that start during the search phase instead of the start window")
     ap.add_argument("--sybil-frac", type=float, default=0, help="fraction of nodes that are sybils: they register, answer queries with sybil ads only and refer sybils")
     ap.add_argument("--bootnodes", type=int, default=0)
@@ -503,7 +515,7 @@ def main():
     cfg = WorldConfig(cache=a.cache, depth=a.depth, bucket_size=a.bucket_size, topic_nodes_limit=a.topic_nodes_limit,
                       aux_limit=a.aux_limit, yield_floor=a.floor, aux_radius=a.aux_radius, ad_lifetime=a.ad_lifetime, rtt=a.rtt)
     sybil = np.random.default_rng(a.seed + 9).random(pop.n) < a.sybil_frac
-    w = World(pop, cfg, a.rtt, a.seed, backoff=a.pass_backoff, sybil=sybil)
+    w = World(pop, cfg, a.rtt, a.seed, backoff=a.pass_backoff, sybil=sybil, idle_replies=a.idle_replies)
     rng = np.random.default_rng(a.seed + 5)
     starts = rng.random(pop.n) * a.start_window
     k = len(shares)
