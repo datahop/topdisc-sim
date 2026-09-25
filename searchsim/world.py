@@ -203,10 +203,16 @@ class WorldConfig(Config):
 
 
 class World:
-    def __init__(self, pop, cfg, rtt, seed, backoff=0.0):
+    def __init__(self, pop, cfg, rtt, seed, backoff=0.0, sybil=None):
         self.pop, self.cfg, self.rtt = pop, cfg, rtt
         self.backoff = backoff
         self.first_found = {}
+        # sybil[i]: node i is an attacker. A sybil registrar answers every query
+        # with sybil ads of the topic only and hands out sybils as aux nodes;
+        # sybils also register their own ids, so honest registrars carry them
+        # in proportion. Sybil searchers are not counted.
+        self.sybil = sybil if sybil is not None else np.zeros(pop.n, dtype=bool)
+        self.sybil_by_topic = {}
         self.now = 0.0
         self.events = []
         self.seq = 0
@@ -316,8 +322,26 @@ class World:
         self.searchers[node] = s
         self.at(self.now, "sstep", node)
 
+    def sybil_aux(self, tid, dists):
+        out = []
+        for wd in dists[:self.cfg.aux_limit]:
+            b = 256 - wd
+            lo, hi = (self.pop.subtree(tid, wd) if b < self.cfg.depth - 1 else self.pop.subtree_within(tid, wd))
+            if hi > lo:
+                cand = lo + np.nonzero(self.sybil[lo:hi])[0]
+                if len(cand):
+                    out.append(int(cand[self.rng.randrange(len(cand))]))
+        return out
+
     def serve_query(self, registrar, topic, tid, dists):
         self.tq_rcv[registrar] += 1
+        if self.sybil[registrar]:
+            pool = self.sybil_by_topic.get(topic)
+            if pool is None:
+                pool = self.sybil_by_topic[topic] = [int(i) for i in np.nonzero(self.sybil & (self.pop.topics == topic) & self.pop.registrant)[0]]
+            results = self.rng.sample(pool, self.cfg.topic_nodes_limit) if len(pool) > self.cfg.topic_nodes_limit else list(pool)
+            self.ads_served[registrar] += len(results)
+            return results, self.sybil_aux(tid, dists)
         tt = self.ttab[registrar]
         tt.purge(self.now)
         d = tt.ads.get(topic)
@@ -465,6 +489,7 @@ def main():
     ap.add_argument("--search-frac", type=float, default=1.0, help="fraction of nodes that search (sampled)")
     ap.add_argument("--pass-backoff", type=float, default=0, help="cap (s) of the exponential gap between passes that found nothing new; 0 = fixed 2 s")
     ap.add_argument("--late-frac", type=float, default=0, help="fraction of registrants that start during the search phase instead of the start window")
+    ap.add_argument("--sybil-frac", type=float, default=0, help="fraction of nodes that are sybils: they register, answer queries with sybil ads only and refer sybils")
     ap.add_argument("--bootnodes", type=int, default=0)
     ap.add_argument("--no-spawn-bias", action="store_true", help="uniform DHT tables instead of tables filled from the nodes alive at start")
     ap.add_argument("--seed", type=int, default=1)
@@ -477,7 +502,8 @@ def main():
     pop.assign_topics(shares, a.register_frac, a.all_register)
     cfg = WorldConfig(cache=a.cache, depth=a.depth, bucket_size=a.bucket_size, topic_nodes_limit=a.topic_nodes_limit,
                       aux_limit=a.aux_limit, yield_floor=a.floor, aux_radius=a.aux_radius, ad_lifetime=a.ad_lifetime, rtt=a.rtt)
-    w = World(pop, cfg, a.rtt, a.seed, backoff=a.pass_backoff)
+    sybil = np.random.default_rng(a.seed + 9).random(pop.n) < a.sybil_frac
+    w = World(pop, cfg, a.rtt, a.seed, backoff=a.pass_backoff, sybil=sybil)
     rng = np.random.default_rng(a.seed + 5)
     starts = rng.random(pop.n) * a.start_window
     k = len(shares)
@@ -487,7 +513,7 @@ def main():
         if pop.registrant[i]:
             t = search_at + rng.random() * a.search_time * 0.5 if late[i] else float(starts[i])
             w.at(float(t), "start_reg", i, int(pop.topics[i]))
-    searchers = [i for i in range(pop.n) if rng.random() < a.search_frac]
+    searchers = [i for i in range(pop.n) if rng.random() < a.search_frac and not sybil[i]]
     if a.search_stagger < 0:
         a.search_stagger = min(0.1, 0.25 * a.search_time / max(1, len(searchers)))
     for j, i in enumerate(searchers):
@@ -521,7 +547,9 @@ def main():
                 if n >= need:
                     return tm
             return None
-        rows.append(dict(searcher=i, topic=s.topic, size=int(sizes[s.topic]), cls=size_class(int(sizes[s.topic])), queries=s.queries,
+        nsyb = sum(1 for r in s.found if sybil[r])
+        rows.append(dict(sybil_found=nsyb, sybil_share=(nsyb / len(s.found)) if s.found else None, eclipsed=bool(s.found) and nsyb == len(s.found),
+                         searcher=i, topic=s.topic, size=int(sizes[s.topic]), cls=size_class(int(sizes[s.topic])), queries=s.queries,
                          passes=s.passes, found=found, reach=len(reach), recall=found / len(reach) if reach else 1.0,
                          t50=at(0.5), t90=at(0.9), t99=at(0.99), settled=s.active_trace[-1][1] if s.active_trace else 0,
                          done=s.done, dur=(getattr(s, "end", w.now) - s.t0)))
@@ -531,7 +559,10 @@ def main():
         if not rs:
             continue
         med = lambda key: (float(np.median([r[key] for r in rs if r[key] is not None])) if any(r[key] is not None for r in rs) else None)
-        by_class[name] = dict(topics=len({r["topic"] for r in rs}), searchers=len(rs), recall_median=med("recall"),
+        shares = [r["sybil_share"] for r in rs if r["sybil_share"] is not None]
+        by_class[name] = dict(sybil_share_median=(float(np.median(shares)) if shares else None), sybil_share_mean=(float(np.mean(shares)) if shares else None),
+                              eclipsed=float(np.mean([r["eclipsed"] for r in rs])),
+                              topics=len({r["topic"] for r in rs}), searchers=len(rs), recall_median=med("recall"),
                               full=float(np.mean([r["recall"] >= 0.999 for r in rs])), queries_median=med("queries"),
                               t50=med("t50"), t90=med("t90"), t99=med("t99"), settled_median=med("settled"))
     adm = np.array(list(w.first_admit.values())) if w.first_admit else np.array([np.nan])
@@ -548,7 +579,7 @@ def main():
                             delay_p90=(float(np.percentile([x for x in v if x is not None], 90)) if any(x is not None for x in v) else None)) for c, v in late_disc.items()}
     fo = np.array(list(fanout.values())) if fanout else np.array([0])
     q = np.array(w.quotes) if w.quotes else np.array([0.0])
-    summary = dict(config=vars(a), events=nev, elapsed=time.time() - t0,
+    summary = dict(config=vars(a), events=nev, elapsed=time.time() - t0, sybil_frac=float(sybil.mean()),
                    registrar_queries=dict(median=float(np.median(w.tq_rcv)), p99=float(np.percentile(w.tq_rcv, 99)), max=int(w.tq_rcv.max())),
                    registrar_regtopic=dict(median=float(np.median(w.reg_rcv)), p99=float(np.percentile(w.reg_rcv, 99)), max=int(w.reg_rcv.max())),
                    ads_held=dict(median=float(np.median(held)), p99=float(np.percentile(held, 99)), max=int(held.max()), total=int(held.sum())),
