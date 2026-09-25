@@ -203,8 +203,10 @@ class WorldConfig(Config):
 
 
 class World:
-    def __init__(self, pop, cfg, rtt, seed):
+    def __init__(self, pop, cfg, rtt, seed, backoff=0.0):
         self.pop, self.cfg, self.rtt = pop, cfg, rtt
+        self.backoff = backoff
+        self.first_found = {}
         self.now = 0.0
         self.events = []
         self.seq = 0
@@ -303,6 +305,11 @@ class World:
         nt = rt.next_time()
         self.at(max(self.now, nt) if nt is not None else self.now + PASS_MIN_S, "reg", node, topic)
 
+    def note_found(self, r, topic, now):
+        key = (r, topic)
+        if key not in self.first_found:
+            self.first_found[key] = now
+
     # --- search ------------------------------------------------------------
     def start_search(self, node, topic, target, stop_at):
         s = SearcherState(self, node, topic, target, stop_at)
@@ -360,9 +367,21 @@ class SearcherState:
         self.pass_start = w.now
         self.active_trace = []
         self.done = False
+        self.idle_passes = 0
+        self.new_in_pass = 0
+
+    def pass_gap(self):
+        """Minimum gap before the next pass: 2 s, doubling after every pass
+        that found nothing new, up to the configured back-off cap."""
+        if self.new_in_pass > 0 or self.w.backoff <= 0:
+            self.idle_passes = 0
+            return PASS_MIN_S
+        self.idle_passes += 1
+        return min(self.w.backoff, PASS_MIN_S * (2 ** self.idle_passes))
 
     def new_pass(self):
         w, cfg = self.w, self.w.cfg
+        self.new_in_pass = 0
         if cfg.adaptive:
             for k in [k for k, e in self.asked.items() if e <= w.now]:
                 del self.asked[k]
@@ -382,19 +401,16 @@ class SearcherState:
         for r in st.results:
             if r not in self.found:
                 self.found.add(r)
+                self.new_in_pass += 1
                 self.trace.append((self.queries, w.now - self.t0, len(self.found)))
+                w.note_found(r, self.topic, w.now)
         st.results.clear()
         if self.target and len(self.found) >= self.target:
             self.done = True; self.end = w.now; return
-        if st.is_done():
+        if st.is_done() or (dst := st.query_target()) is None:
             self.active = st.active
             self.st = None
-            w.at(max(w.now, self.pass_start + PASS_MIN_S), "sstep", self.node)
-            return
-        dst = st.query_target()
-        if dst is None:
-            self.active = st.active; self.st = None
-            w.at(max(w.now, self.pass_start + PASS_MIN_S), "sstep", self.node)
+            w.at(max(w.now, self.pass_start + self.pass_gap()), "sstep", self.node)
             return
         dists = st.buckets_with_free_space()
         self.queries += 1
@@ -447,6 +463,8 @@ def main():
     ap.add_argument("--search-stagger", type=float, default=-1, help="seconds between searcher starts; default spreads the starts over a quarter of the search phase, at most 0.1 s apart")
     ap.add_argument("--target", type=int, default=0, help="conn-driven stop at this many results; 0 = continuous")
     ap.add_argument("--search-frac", type=float, default=1.0, help="fraction of nodes that search (sampled)")
+    ap.add_argument("--pass-backoff", type=float, default=0, help="cap (s) of the exponential gap between passes that found nothing new; 0 = fixed 2 s")
+    ap.add_argument("--late-frac", type=float, default=0, help="fraction of registrants that start during the search phase instead of the start window")
     ap.add_argument("--bootnodes", type=int, default=0)
     ap.add_argument("--no-spawn-bias", action="store_true", help="uniform DHT tables instead of tables filled from the nodes alive at start")
     ap.add_argument("--seed", type=int, default=1)
@@ -459,14 +477,16 @@ def main():
     pop.assign_topics(shares, a.register_frac, a.all_register)
     cfg = WorldConfig(cache=a.cache, depth=a.depth, bucket_size=a.bucket_size, topic_nodes_limit=a.topic_nodes_limit,
                       aux_limit=a.aux_limit, yield_floor=a.floor, aux_radius=a.aux_radius, ad_lifetime=a.ad_lifetime, rtt=a.rtt)
-    w = World(pop, cfg, a.rtt, a.seed)
+    w = World(pop, cfg, a.rtt, a.seed, backoff=a.pass_backoff)
     rng = np.random.default_rng(a.seed + 5)
     starts = rng.random(pop.n) * a.start_window
     k = len(shares)
+    search_at = a.start_window + a.register_wait
+    late = rng.random(pop.n) < a.late_frac
     for i in range(pop.n):
         if pop.registrant[i]:
-            w.at(float(starts[i]), "start_reg", i, int(pop.topics[i]))
-    search_at = a.start_window + a.register_wait
+            t = search_at + rng.random() * a.search_time * 0.5 if late[i] else float(starts[i])
+            w.at(float(t), "start_reg", i, int(pop.topics[i]))
     searchers = [i for i in range(pop.n) if rng.random() < a.search_frac]
     if a.search_stagger < 0:
         a.search_stagger = min(0.1, 0.25 * a.search_time / max(1, len(searchers)))
@@ -515,6 +535,17 @@ def main():
                               full=float(np.mean([r["recall"] >= 0.999 for r in rs])), queries_median=med("queries"),
                               t50=med("t50"), t90=med("t90"), t99=med("t99"), settled_median=med("settled"))
     adm = np.array(list(w.first_admit.values())) if w.first_admit else np.array([np.nan])
+    # late joiners: time from first admission to first discovery by any searcher, by topic class
+    late_disc = {}
+    for i in range(pop.n):
+        if late[i] and pop.registrant[i]:
+            key = (i, int(pop.topics[i]))
+            if key in w.first_admit:
+                adm_at = w.reg_start[key] + w.first_admit[key]
+                cls = size_class(int(sizes[key[1]]))
+                late_disc.setdefault(cls, []).append((w.first_found[key] - adm_at) if key in w.first_found else None)
+    late_summary = {c: dict(n=len(v), found=sum(x is not None for x in v), delay_median=(float(np.median([x for x in v if x is not None])) if any(x is not None for x in v) else None),
+                            delay_p90=(float(np.percentile([x for x in v if x is not None], 90)) if any(x is not None for x in v) else None)) for c, v in late_disc.items()}
     fo = np.array(list(fanout.values())) if fanout else np.array([0])
     q = np.array(w.quotes) if w.quotes else np.array([0.0])
     summary = dict(config=vars(a), events=nev, elapsed=time.time() - t0,
@@ -525,7 +556,8 @@ def main():
                    admission_s=dict(median=float(np.nanmedian(adm)), p90=float(np.nanpercentile(adm, 90)), n=len(w.first_admit)),
                    quoted_wait_s=dict(median=float(np.median(q)), p90=float(np.percentile(q, 90)), n=len(w.quotes)),
                    regtopic_sent_per_registrant=dict(median=float(np.median(w.reg_sent[pop.registrant])), max=int(w.reg_sent.max())),
-                   by_class=by_class)
+                   by_class=by_class, late_joiners=late_summary,
+                   queries_sent=dict(total=int(w.q_sent.sum()), per_searcher_median=float(np.median(w.q_sent[list(w.searchers)])) if w.searchers else 0.0))
     json.dump(summary, open(os.path.join(a.out, "summary.json"), "w"), indent=1)
     json.dump(rows, open(os.path.join(a.out, "searches.json"), "w"))
     np.save(os.path.join(a.out, "tq_rcv.npy"), w.tq_rcv); np.save(os.path.join(a.out, "reg_rcv.npy"), w.reg_rcv)
