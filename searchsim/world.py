@@ -203,11 +203,12 @@ class WorldConfig(Config):
 
 
 class World:
-    def __init__(self, pop, cfg, rtt, seed, backoff=0.0, sybil=None, idle_replies=0, min_sources=0):
+    def __init__(self, pop, cfg, rtt, seed, backoff=0.0, sybil=None, idle_replies=0, min_sources=0, min_buckets=0):
         self.pop, self.cfg, self.rtt = pop, cfg, rtt
         self.backoff = backoff
         self.idle_replies = idle_replies
         self.min_sources = min_sources
+        self.min_buckets = min_buckets
         self.first_found = {}
         # sybil[i]: node i is an attacker. A sybil registrar answers every query
         # with sybil ads of the topic only and hands out sybils as aux nodes;
@@ -399,6 +400,7 @@ class SearcherState:
         self.per_source = {}      # registrar -> results accepted from it
         self.sources = set()
         self.result_src = {}      # result -> registrar that returned it first
+        self.src_buckets = set()  # search buckets of the registrars whose results were accepted
 
     def pass_gap(self):
         """Minimum gap before the next pass: 2 s, doubling after every pass
@@ -424,7 +426,7 @@ class SearcherState:
 
     def step(self):
         w = self.w
-        if self.done or w.now >= self.stop_at or (self.target and len(self.found) >= self.target and (not w.min_sources or len(self.sources) >= w.min_sources)):
+        if self.done or w.now >= self.stop_at or (self.target and len(self.found) >= self.target and (not w.min_sources or len(self.sources) >= w.min_sources) and (not w.min_buckets or len(self.src_buckets) >= w.min_buckets)):
             self.done = True; self.end = w.now; return
         if self.st is None:
             self.new_pass()
@@ -438,12 +440,14 @@ class SearcherState:
                         continue
                     self.per_source[src] = self.per_source.get(src, 0) + 1
                     self.sources.add(src)
+                if src is not None and w.min_buckets:
+                    self.src_buckets.add(bucket_index(self.tid, int(w.pop.ids[src]), w.cfg.depth))
                 self.found.add(r)
                 self.new_in_pass += 1
                 self.trace.append((self.queries, w.now - self.t0, len(self.found)))
                 w.note_found(r, self.topic, w.now)
         st.results.clear()
-        if self.target and len(self.found) >= self.target and (not w.min_sources or len(self.sources) >= w.min_sources):
+        if self.target and len(self.found) >= self.target and (not w.min_sources or len(self.sources) >= w.min_sources) and (not w.min_buckets or len(self.src_buckets) >= w.min_buckets):
             self.done = True; self.end = w.now; return
         # end the pass early after --idle-replies replies in a row brought nothing
         # new, once the searcher holds any result: the walk is not finding ads
@@ -513,6 +517,7 @@ def main():
     ap.add_argument("--search-frac", type=float, default=1.0, help="fraction of nodes that search (sampled)")
     ap.add_argument("--pass-backoff", type=float, default=0, help="cap (s) of the exponential gap between passes that found nothing new; 0 = fixed 2 s")
     ap.add_argument("--min-sources", type=int, default=0, help="connection-driven: accept at most target/min_sources results from one registrar and stop only with results from this many registrars; 0 = off")
+    ap.add_argument("--min-buckets", type=int, default=0, help="connection-driven: stop only with accepted results from registrars in this many distinct distance buckets; 0 = off")
     ap.add_argument("--idle-replies", type=int, default=0, help="end a pass after this many consecutive replies with nothing new; 0 = walk the whole table")
     ap.add_argument("--late-frac", type=float, default=0, help="fraction of registrants that start during the search phase instead of the start window")
     ap.add_argument("--sybil-frac", type=float, default=0, help="fraction of nodes that are sybils: they register, answer queries with sybil ads only and refer sybils")
@@ -529,7 +534,7 @@ def main():
     cfg = WorldConfig(cache=a.cache, depth=a.depth, bucket_size=a.bucket_size, topic_nodes_limit=a.topic_nodes_limit,
                       aux_limit=a.aux_limit, yield_floor=a.floor, aux_radius=a.aux_radius, ad_lifetime=a.ad_lifetime, rtt=a.rtt)
     sybil = np.random.default_rng(a.seed + 9).random(pop.n) < a.sybil_frac
-    w = World(pop, cfg, a.rtt, a.seed, backoff=a.pass_backoff, sybil=sybil, idle_replies=a.idle_replies, min_sources=a.min_sources)
+    w = World(pop, cfg, a.rtt, a.seed, backoff=a.pass_backoff, sybil=sybil, idle_replies=a.idle_replies, min_sources=a.min_sources, min_buckets=a.min_buckets)
     rng = np.random.default_rng(a.seed + 5)
     starts = rng.random(pop.n) * a.start_window
     k = len(shares)
