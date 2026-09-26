@@ -62,7 +62,7 @@ def main():
     ap.add_argument("--topics", type=int, default=100)
     ap.add_argument("--model", default="", help="crawl model JSON for topic shares; else Zipf")
     ap.add_argument("--zipf", type=float, default=1.0)
-    ap.add_argument("--register-frac", type=float, default=0.5)
+    ap.add_argument("--register-frac", type=float, default=1.0)
     ap.add_argument("--all-register", action="store_true")
     ap.add_argument("--floor", type=int, default=0, help="search_yield_floor; 0 = default searcher")
     ap.add_argument("--aux-radius", type=int, default=0)

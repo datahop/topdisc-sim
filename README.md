@@ -36,8 +36,9 @@ shares and churn fits from the 24 h discv5 crawl of 2026-09-18, made by
   returns one node per requested distance from its own table, first 8
   distances only, exactly as `collectTopicAuxNodes` does.
 - **Topics**: shares from the crawl model (the k-1 largest chains, the k-th
-  the folded tail) or Zipf; a fraction of nodes register, every node searches
-  its topic.
+  the folded tail) or Zipf; every node has exactly one topic, registers it
+  and searches it (`--register-frac` lowers the registering share for
+  experiments; the crawl-mix runs before 26 September used 0.5).
 - **Ads** (`run` only): every registrant holds `copies` (5) ads in each of
   `depth` (10) rings around the topic hash, on registrars drawn uniformly
   within the ring, up to the registrar's cache (5000): the mixed steady state
