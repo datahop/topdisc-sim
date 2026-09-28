@@ -1,4 +1,4 @@
-# topdisc-searchsim
+# topdisc-sim
 
 A Python model of TopDisc (datahop/go-ethereum, branch topdisc) for
 populations the simnet testbed cannot afford. Two entry points:
