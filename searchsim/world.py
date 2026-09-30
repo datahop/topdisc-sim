@@ -260,7 +260,7 @@ class World:
         for wd in want:
             m = np.nonzero(d == wd)[0]
             if len(m):
-                out.append(int(idx[self.rng.randrange(len(m))]))
+                out.append(int(idx[m[self.rng.randrange(len(m))]]))
         return out
 
     # --- registration ----------------------------------------------------
