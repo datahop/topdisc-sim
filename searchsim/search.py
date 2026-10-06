@@ -96,6 +96,10 @@ class Search:
         self.spare_used = False
         self.result_seen = set()
         self.results = []
+        # searchBucketIPLimit: one node per /24 in a bucket. pop.net is the
+        # shared /24 of a node, or -1 when the node has a /24 of its own.
+        self.net = getattr(pop, "net", None)
+        self.nets_b = [set() for _ in range(cfg.depth)]
 
     def bucket(self, i):
         return bucket_index(int(self.tid), int(self.pop.ids[i]), self.cfg.depth)
@@ -118,11 +122,19 @@ class Search:
                 if b in check:
                     continue
                 check.add(b)
+            if self.net is not None:
+                k = int(self.net[i])
+                if k >= 0:
+                    if k in self.nets_b[b]:
+                        continue
+                    self.nets_b[b].add(k)
             self.new[b].add(i)
             self.origin.setdefault(i, src is not None)
 
     def remove_node(self, i):
         b = self.bucket(i)
+        if self.net is not None and (i in self.new[b] or i in self.asked_b[b]):
+            self.nets_b[b].discard(int(self.net[i]))
         self.new[b].discard(i)
         self.asked_b[b].discard(i)
 
@@ -186,13 +198,15 @@ class Search:
             jump = int(math.ceil(math.log2(self.cfg.yield_floor / upper)))
             self.active = min(self.cfg.depth - 1, bi + min(jump, MAX_JUMP))
 
-    def add_query_results(self, frm, results, now):
+    def add_query_results(self, frm, results, now, ads=None):
+        """ads is the size of the reply before the result filter; the adaptive
+        rule samples it, as Search.AddReply does."""
         b = self.bucket(frm)
         self.new[b].discard(frm)
         self.asked_b[b].add(frm)
         self.num_requests[b] += 1
         if self.cfg.adaptive:
-            self.observe(b, len(results))
+            self.observe(b, len(results) if ads is None else ads)
             self.asked[frm] = now + self.cfg.ad_lifetime
             self.remove_node(frm)
         new = 0
