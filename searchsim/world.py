@@ -16,12 +16,13 @@ import time
 
 import numpy as np
 
-from .population import Population, shares_from_model, zipf_shares, bucket_index
+from .population import Population, shares_from_model, zipf_shares, bucket_index, logdist, DHT_MIN_DIST
 from .search import Config, Search, PASS_MIN_S
 
 STANDBY, WAITING, REGISTERED = 0, 1, 2
 OCCUPANCY_EXP, WAIT_BASE_MOD, WAIT_FLOOR = 10, 0.1, 1.0
 REG_BUCKET_SIZE, REG_STANDBY = 5, 20
+TABLE_IP_LIMIT, BUCKET_IP_LIMIT = 10, 2     # discv5 table: nodes per /24 in the table and in a bucket
 
 
 class Attempt:
@@ -62,6 +63,10 @@ class RegTable:
                     continue
             if self.counts[bi][STANDBY] >= REG_STANDBY:
                 continue
+            if w.net is not None:
+                k = w.net[n]
+                if k >= 0 and any(w.net[m] == k for m in b):
+                    continue
             b[n] = Attempt()
             self.counts[bi][STANDBY] += 1
             if src_att is not None:
@@ -153,10 +158,12 @@ class RegTable:
 
 class TopicTable:
     """One registrar's ad cache and admission state."""
-    __slots__ = ("ads", "count", "lb", "heap")
+    __slots__ = ("ads", "count", "lb", "heap", "ipc", "iplb")
+    NET = None     # shared /24 per node, set by the World when sybils share prefixes
 
     def __init__(self):
         self.ads, self.count, self.lb, self.heap = {}, 0, {}, []
+        self.ipc, self.iplb = {}, {}     # ads held per shared /24, IP lower bound per shared /24
 
     def purge(self, now):
         while self.heap and self.heap[0][0] <= now:
@@ -165,6 +172,10 @@ class TopicTable:
             if d is not None and d.get(adv) == exp:
                 del d[adv]
                 self.count -= 1
+                if self.NET is not None:
+                    k = self.NET[adv]
+                    if k >= 0:
+                        self.ipc[k] -= 1
                 if not d:
                     del self.ads[t]
 
@@ -178,12 +189,24 @@ class TopicTable:
         service = base * (len(d) if d else 0) / (self.count + 1)
         lbv, lbs = self.lb.get(t, (0.0, 0.0))
         rem = max(0.0, lbv - (now - lbs))
-        required = max(service, rem) + 0.0     # IP component: 0 (LAN or single address per /24)
+        # IP component: 0 for a node with a /24 of its own. A node that shares
+        # its /24 with an ad in the table is over the balanced count at every
+        # level of the IP tree, so its score is taken as 1.
+        net = int(self.NET[adv]) if self.NET is not None else -1
+        ipsecs = iprem = 0.0
+        if net >= 0:
+            if self.ipc.get(net, 0) > 0:
+                ipsecs = base
+            v, at = self.iplb.get(net, (0.0, 0.0))
+            iprem = max(0.0, v - (now - at))
+        required = max(service, rem) + max(ipsecs, iprem)
         if waited < required:
             remaining = required - waited
             if remaining > WAIT_FLOOR:
                 if service > rem:
                     self.lb[t] = (service, now)
+                if ipsecs > iprem:
+                    self.iplb[net] = (ipsecs, now)
                 return remaining
         if self.count >= cfg.cache:
             return max(WAIT_FLOOR, self.heap[0][0] - now) if self.heap else WAIT_FLOOR
@@ -192,6 +215,8 @@ class TopicTable:
             d = self.ads[t] = {}
         d[adv] = exp
         self.count += 1
+        if net >= 0:
+            self.ipc[net] = self.ipc.get(net, 0) + 1
         heapq.heappush(self.heap, (exp, t, adv))
         return 0.0
 
@@ -203,8 +228,33 @@ class WorldConfig(Config):
 
 
 class World:
-    def __init__(self, pop, cfg, rtt, seed, backoff=0.0, sybil=None, idle_replies=0, min_sources=0, min_buckets=0):
+    def __init__(self, pop, cfg, rtt, seed, backoff=0.0, sybil=None, idle_replies=0, min_sources=0, min_buckets=0,
+                 registrar_limit=0, sybil_fresh=False, sybil_nets=0, mix_registrars=0):
         self.pop, self.cfg, self.rtt = pop, cfg, rtt
+        # mix_registrars: result mixer. The new results of each registrar wait
+        # in a queue of their own. While this many registrars have results
+        # waiting, the search hands out one result from each in turn. The end
+        # of a pass hands out what is left, also one registrar at a time. 0 = off.
+        self.mix_registrars = mix_registrars
+        # sybil_nets: the sybils share this many /24 prefixes, and the IP limits
+        # of the Go code apply to them: discv5 table (10 per table, 2 per
+        # bucket), search and registration table (1 per bucket), admission IP
+        # score. 0 = every sybil has a /24 of its own, no limit binds.
+        self.net = None
+        if sybil_nets > 0 and sybil is not None and sybil.any():
+            self.net = np.full(pop.n, -1, dtype=np.int64)
+            sy = np.nonzero(sybil)[0]
+            self.net[sy] = np.random.default_rng(seed + 11).integers(0, sybil_nets, size=len(sy))
+        pop.net = self.net
+        TopicTable.NET = self.net
+        # registrar_limit: SearchFilter.Take/Release of the Go code. A registrar
+        # contributes this many new results per ad lifetime; the rest are held
+        # until the end of the pass. 0 = off.
+        self.registrar_limit = registrar_limit
+        # sybil_fresh: a sybil registrar answers with 16 new sybil ids on every
+        # query (ids below zero) in place of the sybils that belong to the topic.
+        self.sybil_fresh = sybil_fresh
+        self.fresh_id = 0
         self.backoff = backoff
         self.idle_replies = idle_replies
         self.min_sources = min_sources
@@ -239,10 +289,47 @@ class World:
         self.seq += 1
         heapq.heappush(self.events, (t, self.seq, kind, args))
 
+    def dht(self, i):
+        """The discv5 table of node i with the IP limits applied. An entry
+        over the limit is replaced by a node of the same bucket that has a /24
+        of its own, when a few draws find one."""
+        idx = self.pop.dht_table(i)
+        if self.net is None:
+            return idx
+        nets = self.net[idx]
+        if not (nets >= 0).any():
+            return idx
+        x = int(self.pop.ids[i])
+        rng = random.Random(i * 31 + 7)
+        out = list(int(j) for j in idx)
+        have = set(out)
+        tab, buck = {}, {}
+        order = [j for j in range(len(out)) if nets[j] >= 0]
+        rng.shuffle(order)
+        for j in order:
+            k = int(nets[j])
+            d = max(logdist(x, int(self.pop.ids[out[j]])), DHT_MIN_DIST + 1)
+            if tab.get(k, 0) < TABLE_IP_LIMIT and buck.get((d, k), 0) < BUCKET_IP_LIMIT:
+                tab[k] = tab.get(k, 0) + 1
+                buck[(d, k)] = buck.get((d, k), 0) + 1
+                continue
+            lo, hi = self.pop.subtree(x, d) if d > DHT_MIN_DIST + 1 else self.pop.subtree_within(x, d)
+            new = -1
+            for _ in range(8 if hi > lo else 0):
+                c = lo + rng.randrange(hi - lo)
+                if c != i and c not in have and self.net[c] < 0:
+                    new = c
+                    break
+            have.discard(out[j])
+            out[j] = new
+            if new >= 0:
+                have.add(new)
+        return np.array([j for j in out if j >= 0], dtype=np.int64)
+
     def table(self, i):
         t = self._tables.get(i)
         if t is None:
-            idx = self.pop.dht_table(i)
+            idx = self.dht(i)
             t = (idx, self.pop.ids[idx])
             self._tables[i] = t
         return t
@@ -275,7 +362,7 @@ class World:
         if rt is None or rt.node_count() == 0:
             if rt is None:
                 rt = self.reg[key] = RegTable(self.cfg.depth, self.cfg.ad_lifetime)
-            seeds = [int(i) for i in self.pop.dht_table(node)]
+            seeds = [int(i) for i in self.dht(node)]
             self.rng.shuffle(seeds)
             rt.add_nodes(self, tid, None, [s for s in seeds if s != node])
             if rt.node_count() == 0:
@@ -338,6 +425,11 @@ class World:
 
     def serve_query(self, registrar, topic, tid, dists):
         self.tq_rcv[registrar] += 1
+        if self.sybil[registrar] and self.sybil_fresh:
+            results = list(range(self.fresh_id - 1, self.fresh_id - 1 - self.cfg.topic_nodes_limit, -1))
+            self.fresh_id -= self.cfg.topic_nodes_limit
+            self.ads_served[registrar] += len(results)
+            return results, self.sybil_aux(tid, dists)
         if self.sybil[registrar]:
             pool = self.sybil_by_topic.get(topic)
             if pool is None:
@@ -385,7 +477,7 @@ class SearcherState:
         self.w, self.node, self.topic, self.target, self.stop_at = w, node, topic, target, stop_at
         self.tid = int(w.pop.topic_ids[topic])
         self.rng = random.Random(node * 7919 + 1)
-        self.seeds = [int(i) for i in w.pop.dht_table(node) if int(i) != node]
+        self.seeds = [int(i) for i in w.dht(node) if int(i) != node]
         self.asked, self.active = {}, 0
         self.found, self.trace = set(), []
         self.queries, self.passes = 0, 0
@@ -400,6 +492,11 @@ class SearcherState:
         self.per_source = {}      # registrar -> results accepted from it
         self.sources = set()
         self.result_src = {}      # result -> registrar that returned it first
+        self.sybil_queries = 0
+        self.order = []           # (result, registrar it was taken from, time, queries), in delivery order
+        self.reg_count = {}       # registrar -> [results taken, expiry]
+        self.held, self.held_src = [], {}
+        self.mixq, self.mix_in = {}, {}   # registrar -> results waiting; result -> its registrar
         self.src_buckets = set()  # search buckets of the registrars whose results were accepted
 
     def pass_gap(self):
@@ -424,14 +521,9 @@ class SearcherState:
         self.idle_replies = 0
         self.active_trace.append((w.now - self.t0, self.st.active))
 
-    def step(self):
+    def deliver(self, results):
         w = self.w
-        if self.done or w.now >= self.stop_at or (self.target and len(self.found) >= self.target and (not w.min_sources or len(self.sources) >= w.min_sources) and (not w.min_buckets or len(self.src_buckets) >= w.min_buckets)):
-            self.done = True; self.end = w.now; return
-        if self.st is None:
-            self.new_pass()
-        st = self.st
-        for r in st.results:
+        for r in results:
             if r not in self.found:
                 src = self.result_src.get(r)
                 if w.min_sources and self.target and src is not None:
@@ -445,7 +537,79 @@ class SearcherState:
                 self.found.add(r)
                 self.new_in_pass += 1
                 self.trace.append((self.queries, w.now - self.t0, len(self.found)))
-                w.note_found(r, self.topic, w.now)
+                self.order.append((r, self.held_src.get(r, src), w.now - self.t0, self.queries))
+                if r >= 0:
+                    w.note_found(r, self.topic, w.now)
+
+    def mix_rows(self, flush):
+        w = self.w
+        while True:
+            ready = [d for d, q in self.mixq.items() if q]
+            if not ready or (len(ready) < w.mix_registrars and not flush):
+                break
+            row = []
+            for d in ready:
+                r = self.mixq[d].pop(0)
+                del self.mix_in[r]
+                self.result_src[r] = d
+                row.append(r)
+            self.deliver(row)
+        if flush:
+            self.mixq = {}
+
+    def take(self, dst, results):
+        """SearchFilter.Take."""
+        w = self.w
+        results = [int(r) for r in results]
+        if w.mix_registrars:
+            q = self.mixq.setdefault(dst, [])
+            for r in results:
+                if r in self.found or r == self.node or r in self.mix_in:
+                    continue
+                self.mix_in[r] = dst
+                q.append(r)
+            self.mix_rows(False)
+            return []
+        if not w.registrar_limit:
+            return results
+        rc = self.reg_count.get(dst)
+        if rc is None or rc[1] <= w.now:
+            rc = self.reg_count[dst] = [0, w.now + w.cfg.ad_lifetime]
+        out = []
+        for r in results:
+            if r in self.found or r == self.node:
+                continue
+            if rc[0] >= w.registrar_limit:
+                if r not in self.held_src:
+                    self.held_src[r] = dst
+                    self.held.append(r)
+                continue
+            rc[0] += 1
+            self.held_src.pop(r, None)
+            self.result_src[r] = dst
+            out.append(r)
+        return out
+
+    def release(self):
+        """SearchFilter.Release, at the end of a pass: the held results are
+        handed out in arrival order."""
+        if self.w.mix_registrars:
+            self.mix_rows(True)
+            return
+        if not self.held:
+            return
+        rel = [r for r in self.held if r in self.held_src and r not in self.found]
+        self.deliver(rel)
+        self.held, self.held_src = [], {}
+
+    def step(self):
+        w = self.w
+        if self.done or w.now >= self.stop_at or (self.target and len(self.found) >= self.target and (not w.min_sources or len(self.sources) >= w.min_sources) and (not w.min_buckets or len(self.src_buckets) >= w.min_buckets)):
+            self.done = True; self.end = w.now; return
+        if self.st is None:
+            self.new_pass()
+        st = self.st
+        self.deliver(st.results)
         st.results.clear()
         if self.target and len(self.found) >= self.target and (not w.min_sources or len(self.sources) >= w.min_sources) and (not w.min_buckets or len(self.src_buckets) >= w.min_buckets):
             self.done = True; self.end = w.now; return
@@ -453,10 +617,12 @@ class SearcherState:
         # new, once the searcher holds any result: the walk is not finding ads
         if w.idle_replies and self.found and self.idle_replies >= w.idle_replies:
             st.results.clear()
+            self.release()
             self.active = st.active; self.st = None
             w.at(max(w.now, self.pass_start + self.pass_gap()), "sstep", self.node)
             return
         if st.is_done() or (dst := st.query_target()) is None:
+            self.release()
             self.active = st.active
             self.st = None
             w.at(max(w.now, self.pass_start + self.pass_gap()), "sstep", self.node)
@@ -464,6 +630,8 @@ class SearcherState:
         dists = st.buckets_with_free_space()
         self.queries += 1
         w.q_sent[self.node] += 1
+        if w.sybil[dst]:
+            self.sybil_queries += 1
         results, aux = w.serve_query(dst, self.topic, self.tid, dists)
         w.at(w.now + w.rtt, "sreply", self.node, dst, results, aux)
 
@@ -475,8 +643,9 @@ class SearcherState:
         before = st.active
         for r in results:
             self.result_src.setdefault(int(r), dst)
-        new = st.add_query_results(dst, results, w.now)
-        self.idle_replies = 0 if any(int(r) not in self.found for r in results) else self.idle_replies + 1
+        fresh = any(int(r) not in self.found for r in results)
+        new = st.add_query_results(dst, self.take(dst, results), w.now, ads=len(results))
+        self.idle_replies = 0 if fresh else self.idle_replies + 1
         if st.active != before:
             self.active_trace.append((w.now - self.t0, st.active))
         w.at(w.now, "sstep", self.node)
@@ -521,6 +690,10 @@ def main():
     ap.add_argument("--idle-replies", type=int, default=0, help="end a pass after this many consecutive replies with nothing new; 0 = walk the whole table")
     ap.add_argument("--late-frac", type=float, default=0, help="fraction of registrants that start during the search phase instead of the start window")
     ap.add_argument("--sybil-frac", type=float, default=0, help="fraction of nodes that are sybils: they register, answer queries with sybil ads only and refer sybils")
+    ap.add_argument("--sybil-nets", type=int, default=0, help="the sybils share this many /24 prefixes and the IP limits of the tables apply; 0 = every sybil has its own /24")
+    ap.add_argument("--sybil-fresh", action="store_true", help="a sybil registrar answers every query with new sybil ids")
+    ap.add_argument("--mix-registrars", type=int, default=0, help="result mixer: hand out results one registrar at a time, and only while this many registrars have results waiting; the end of a pass hands out the rest; 0 = off")
+    ap.add_argument("--registrar-limit", type=int, default=0, help="results a search takes from one registrar per ad lifetime, the rest are held until the pass ends; 0 = off")
     ap.add_argument("--bootnodes", type=int, default=0)
     ap.add_argument("--no-spawn-bias", action="store_true", help="uniform DHT tables instead of tables filled from the nodes alive at start")
     ap.add_argument("--seed", type=int, default=1)
@@ -534,7 +707,8 @@ def main():
     cfg = WorldConfig(cache=a.cache, depth=a.depth, bucket_size=a.bucket_size, topic_nodes_limit=a.topic_nodes_limit,
                       aux_limit=a.aux_limit, yield_floor=a.floor, aux_radius=a.aux_radius, ad_lifetime=a.ad_lifetime, rtt=a.rtt)
     sybil = np.random.default_rng(a.seed + 9).random(pop.n) < a.sybil_frac
-    w = World(pop, cfg, a.rtt, a.seed, backoff=a.pass_backoff, sybil=sybil, idle_replies=a.idle_replies, min_sources=a.min_sources, min_buckets=a.min_buckets)
+    w = World(pop, cfg, a.rtt, a.seed, backoff=a.pass_backoff, sybil=sybil, idle_replies=a.idle_replies, min_sources=a.min_sources, min_buckets=a.min_buckets,
+              registrar_limit=a.registrar_limit, sybil_fresh=a.sybil_fresh, sybil_nets=a.sybil_nets, mix_registrars=a.mix_registrars)
     rng = np.random.default_rng(a.seed + 5)
     starts = rng.random(pop.n) * a.start_window
     k = len(shares)
@@ -578,8 +752,19 @@ def main():
                 if n >= need:
                     return tm
             return None
-        nsyb = sum(1 for r in s.found if sybil[r])
-        rows.append(dict(sybil_found=nsyb, sybil_share=(nsyb / len(s.found)) if s.found else None, eclipsed=bool(s.found) and nsyb == len(s.found),
+        nsyb = sum(1 for r in s.found if r < 0 or sybil[r])
+        first = {}
+        for T in (1, 16, 50):
+            o = s.order[:T]
+            if len(o) < T:
+                first[T] = None
+                continue
+            per = {}
+            for r, src, tm, q in o:
+                per[src] = per.get(src, 0) + 1
+            first[T] = dict(t=o[-1][2], q=o[-1][3], sybil=sum(1 for r, _, _, _ in o if r < 0 or sybil[r]) / T,
+                            top=max(per.values()) / T, sources=len(per))
+        rows.append(dict(first1=first[1], first16=first[16], first50=first[50], results=len(s.found), sybil_queries=s.sybil_queries, sybil_found=nsyb, sybil_share=(nsyb / len(s.found)) if s.found else None, eclipsed=bool(s.found) and nsyb == len(s.found),
                          searcher=i, topic=s.topic, size=int(sizes[s.topic]), cls=size_class(int(sizes[s.topic])), queries=s.queries,
                          passes=s.passes, found=found, reach=len(reach), recall=found / len(reach) if reach else 1.0,
                          t50=at(0.5), t90=at(0.9), t99=at(0.99), settled=s.active_trace[-1][1] if s.active_trace else 0,
@@ -610,7 +795,14 @@ def main():
                             delay_p90=(float(np.percentile([x for x in v if x is not None], 90)) if any(x is not None for x in v) else None)) for c, v in late_disc.items()}
     fo = np.array(list(fanout.values())) if fanout else np.array([0])
     q = np.array(w.quotes) if w.quotes else np.array([0.0])
+    hon_ads = syb_ads = 0
+    for r, tt in enumerate(w.ttab):
+        if not sybil[r]:
+            for t, d in tt.ads.items():
+                ns = sum(1 for adv in d if sybil[adv])
+                syb_ads += ns; hon_ads += len(d) - ns
     summary = dict(config=vars(a), events=nev, elapsed=time.time() - t0, sybil_frac=float(sybil.mean()),
+                   sybil_ad_share=(syb_ads / (syb_ads + hon_ads)) if syb_ads + hon_ads else 0.0,
                    registrar_queries=dict(median=float(np.median(w.tq_rcv)), p99=float(np.percentile(w.tq_rcv, 99)), max=int(w.tq_rcv.max())),
                    registrar_regtopic=dict(median=float(np.median(w.reg_rcv)), p99=float(np.percentile(w.reg_rcv, 99)), max=int(w.reg_rcv.max())),
                    ads_held=dict(median=float(np.median(held)), p99=float(np.percentile(held, 99)), max=int(held.max()), total=int(held.sum())),
