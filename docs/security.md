@@ -80,6 +80,35 @@ so no registrar can fill a lookup alone. The implementation lost that:
 both limits are 16 and one query is in flight, so one reply fills a
 connection-driven node. Either defence above restores the property.
 
+## IP limits per search
+
+The search table is rebuilt every pass, so a per-bucket /24 limit has no memory: an attacker
+holding a few /24s can place a fresh sybil ID in every bucket on every pass. Here the attacker
+holds 2 /24s, and its registrars answer with no advertisements until the search reaches the
+closest bucket, then with 11 useless ones, and refer other sybils as auxiliary ENRs for the
+closest buckets (`--attack A3`). 30,000 nodes, honest addresses from the 24 h mainnet crawl
+(`--honest-nets crawl`), 918 searchers, one seed. The limits compared are 2 registrars per /24
+in a bucket (`--search-bucket-ip-limit 2`) and at most N distinct node IDs per /24 in one
+search, each counted for one ad lifetime (`--w1p --w1p-limit N`).
+
+Under the attack:
+
+| Limits | Sybil share of queries | Passes with no honest query | Recall | Searchers reaching 90 % | Mean t90 |
+|---|---:|---:|---:|---:|---:|
+| 1 per bucket, none per search | 92.8 % | 1,120,044 | 97.3 % | 858 / 918 | 1,120 s |
+| 2 per bucket, none per search | 92.1 % | 1,117,039 | 73.2 % | 557 / 918 | 1,267 s |
+| 2 per bucket, 10 per search | 0.63 % | 1,344 | 100 % | 918 / 918 | 132 s |
+
+With no attack, the limits of 2 per bucket and 10 per search raise the mean t90 from 104.6 s to
+123.9 s, with recall at 100 %. Per-search limits of 1 and 2 also stop the attack, with a sybil
+share of 0.07 % and 0.13 %, but raise the mean t90 with no attack to 273 s and 175 s. The
+attacker's allowance grows by 10 with each further /24.
+
+```sh
+python3 -m searchsim.world --nodes 30000 --fork-faithful --honest-nets crawl --attack A3 \
+  --attack-nets 2 --search-bucket-ip-limit 2 --w1p --w1p-limit 10 --seed 1 --out runs/a3-w1p10/
+```
+
 ## Decision needed
 
 Two ways to get the cube: cap the reply at the registrar (`topicNodesResultLimit`
