@@ -87,6 +87,39 @@ searcher, on the 25k crawl mix.
   is never). Registrations and buckets per advertiser count every registrant,
   zero for one without a live ad. The aggregator marks seeds with no value.
 
+## Results
+
+25,000 nodes, the 100-topic crawl mix, 8 % of nodes searching for 1,800 s, three seeds per
+cell unless noted. Recall is the median share of a topic's providers a searcher found; t90 is
+the median time to 90 % of them.
+
+No attack, mean of three seeds:
+
+| C | Busiest registrar: ads held | Busiest registrar: REGTOPIC received | Recall, every class | t90, 1,000+ topics | Abandoned registrars per advertiser |
+|---:|---:|---:|---:|---:|---:|
+| 500   | 138   | 47,647 | 100 % | 120 s | 252 |
+| 1,000 | 233   | 50,517 | 100 % | 116 s | 131 |
+| 2,500 | 546   | 57,737 | 100 % | 109 s | 52  |
+| 5,000 | 1,011 | 68,848 | 100 % | 109 s | 23  |
+
+The busiest registrar holds 20 to 28 % of C at every size. The median admission wait is 1.2 s
+at every size.
+
+Sybil advertisers, at each of the four sizes:
+
+| Workload | Honest recall | Eclipsed searchers | Sybil share of results, 1,000+ topics |
+|---|---:|---:|---:|
+| Target flood, 1 sybil per honest advertiser, 4 /24s | 100 % | 0 | 22.8 % |
+| Occupation, 300 fake topics, partitioned, 4 /24s | 100 % | 0 | 0 |
+| Target flood, diverse addresses or giving up at 1.5 E (C 1,000 and 5,000, one seed) | 100 % | 0 | 21.6 % |
+| Occupation, diverse addresses or spread hashes (C 1,000 and 5,000, one seed) | 100 % | 0 | 0 |
+| Target flood, 4 sybils per honest advertiser, 10,000 nodes (one seed) | 99.8 to 99.9 % | 0 | 46.1 % |
+| Same, with the rate budget | 100 % | 0 | 45.9 % |
+
+Topics outside the flooded 1,000+ class see no sybil results. C changes neither recall nor the
+sybil share: a smaller cache lowers the load on the busiest registrar and costs advertisers
+more abandoned attempts.
+
 ## Deviations from Go
 
 - One REGTOPIC in flight per advertiser and topic (Go: 4). This slows how fast
@@ -105,15 +138,16 @@ searcher, on the 25k crawl mix.
 
 ## Rerun
 
+```sh
 PY=python3   # with requirements.txt installed
-PY=~/workspace/datahop/sim-sybil/.venv/bin/python
 COMMON="--nodes 25000 --topics 100 --model models/crawl-2026-09-18.json --fork-faithful \
-  --honest-nets crawl --depth 18 --reg-bucket-size 10 --search-frac 0.08 --search-time 1800"
+  --honest-nets crawl --depth 18 --reg-bucket-size 10 --search-frac 0.08 --search-time 1800 \
+  --fork-mix-registrars 10"
 $PY -m searchsim.world $COMMON --cache 1000 --seed 1 --out runs/capacity/h-c1000-s1
 $PY -m searchsim.world $COMMON --cache 1000 --seed 1 --flood target --flood-ratio 1 \
   --flood-nets 4 --out runs/capacity/t-c1000-s1
-$PY -m searchsim.world $COMMON --cache 1000 --seed 1 --flood occupy --flood-topics 300 \
-  --flood-nets 4 --out runs/capacity/o-c1000-s1
+$PY -m searchsim.world $COMMON --cache 1000 --seed 1 --flood occupy-partitioned --flood-topics 300 \
+  --flood-nets 4 --out runs/capacity/op-c1000-s1
 $PY -m searchsim.aggregate --matrix runs/capacity/*/ --out RESULTS.md   # matrix runs only, each once
 ```
 
