@@ -87,8 +87,9 @@ Two ways to get the cube: cap the reply at the registrar (`topicNodesResultLimit
 search iterator interleave results so that no 16 consecutive results come from
 one registrar (consumer side, keeps the tail, needs source tracking in the
 iterator). The referral channel stays open in both; the per-/24 aux limit is
-the next lever there. Not evaluated: the admission IP-diversity score against
-a sybil cluster on one prefix (the model's IP term is zero).
+the next lever there. Not evaluated here: the admission IP-diversity score against
+a sybil cluster on one prefix (the model's IP term was zero for these runs;
+`world` now applies the 703d5a2 rule with the IP term, see `capacity.md`).
 
 Runs: `runs/sybil`, `runs/sybil3`, `runs/cap6`, `runs/sybilmix` on London,
 `python3 -m searchsim.world --sybil-frac ... --topic-nodes-limit ... --min-sources ... --min-buckets ...`.

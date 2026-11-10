@@ -25,6 +25,14 @@ does, `--target 0` searches continuously. The crawl model in `models/` (topic
 shares and churn fits from the 24 h discv5 crawl of 2026-09-18, made by
 `cmd/crawl/model.py` in datahop/topdisc-testbed) gives the topic sizes.
 
+`world --fork-faithful` runs every search as the fork's `topicSearch` does
+(`ForkSearch`, `ForkSearcherState`) with its values: an 18-bucket search
+table of 8 nodes and one per /24, floor 8, aux radius 1, 32 queries a pass
+counting failures, the directional move rule, the failed set, the result
+mixer (5 registrars or 5 s), the 60 s pass back-off and the 0.7 s response
+timeout (`--silent-frac` nodes never answer). Registration and ads keep
+`--depth`. Without the flag the original searcher runs unchanged.
+
 ## What is modelled
 
 - **IDs**: N random 64-bit IDs, sorted. Every "nodes at log-distance d from
@@ -42,12 +50,18 @@ shares and churn fits from the 24 h discv5 crawl of 2026-09-18, made by
 - **Ads** (`run` only): every registrant holds `copies` (5) ads in each of
   `depth` (10) rings around the topic hash, on registrars drawn uniformly
   within the ring, up to the registrar's cache (5000): the mixed steady state
-  of the walk. `world` simulates the walk instead: the 10-bucket registration
-  table with 5 active and 20 standby per bucket, seeded from the node's DHT
-  table and refilled from the aux nodes in REGTOPIC replies, tickets and
-  re-sends at the quoted time, the 1.5-lifetime attempt budget, expiry and
-  re-placement; registrars admit by cache occupancy, topic share, the
-  per-topic lower bound and the 1 s floor (the IP term is zero).
+  of the walk. `world` simulates the walk instead: the `--depth`-bucket
+  registration table with `--reg-bucket-size` (5; Go uses 10) active and 20
+  standby per bucket, seeded from the node's DHT table and refilled from the
+  aux nodes in REGTOPIC replies, tickets and re-sends at the quoted time, the
+  1.5-lifetime attempt budget, a registrar dropped over budget kept out for one
+  ad lifetime, expiry and re-placement. Registrars run the topdisc 703d5a2
+  admission rule through the Go-pinned port `searchsim/go_registrar.py`
+  (occupancy, topic share and its lower bound, the IP-tree score and its
+  bounds, the G term, the 24 h cap, ticket credit and timing). Each node's
+  IPv4 address comes from its `--honest-nets` /24 (otherwise a distinct
+  public address), so the IP term is live; `--no-ip-score` turns it off.
+  See `docs/capacity.md`.
 - **DHT tables** are filled with a weight by spawn order, (spawn + 20)^-0.5,
   fitted on the 10k simnet runs, where the search load served falls 20x from
   the first ten nodes to the last half: early nodes sit in far more tables.
@@ -89,9 +103,9 @@ the adaptive settled buckets within one of the measured ones, registrar
 load median within 2x and p99 within 2x. The default's extreme maximum stays
 about 7x under the measured 715k queries over 4 h: the spawn-order table
 weight reproduces the direction and about a quarter of the measured gradient,
-so the busiest nodes are under-loaded. Quoted waits are lower than measured
-because the IP term is not modelled (the measured runs had it maxed by their
-address scheme).
+so the busiest nodes are under-loaded. Quoted waits were lower than measured
+because the IP term was not modelled at the time (the measured runs had it
+maxed by their address scheme); `world` now applies it.
 
 
 Against the 10k simnet runs of 2026-09-21 (100 crawl topics, 4 h,
