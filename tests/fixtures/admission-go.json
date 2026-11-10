@@ -1,0 +1,61 @@
+{
+  "go_revision": "90b0983221be9ce26a3b610c039675957ed4655a",
+  "source": "Actual iptree.go and waitTime/secondsToDuration/lowerBound methods; only dependency stubs substituted",
+  "cases": [
+    {
+      "name": "empty",
+      "count": 0,
+      "topic_count": 0,
+      "style": "spread",
+      "now_ns": 0,
+      "bound_ns": 0,
+      "wait_ns": 0,
+      "ip_score": 0,
+      "service_s": 0
+    },
+    {
+      "name": "half_full",
+      "count": 2500,
+      "topic_count": 25,
+      "style": "spread",
+      "now_ns": 0,
+      "bound_ns": 0,
+      "wait_ns": 921231507398,
+      "ip_score": 0,
+      "service_s": 921.2315073970412
+    },
+    {
+      "name": "nearly_full",
+      "count": 4999,
+      "topic_count": 1,
+      "style": "spread",
+      "now_ns": 0,
+      "bound_ns": 0,
+      "wait_ns": 86400000000000,
+      "ip_score": 0,
+      "service_s": 1.7578125000019364e+35
+    },
+    {
+      "name": "repeated_prefix",
+      "count": 128,
+      "topic_count": 0,
+      "style": "repeated",
+      "now_ns": 0,
+      "bound_ns": 0,
+      "wait_ns": 99982264052,
+      "ip_score": 0.8571428571428571,
+      "service_s": 0
+    },
+    {
+      "name": "lower_bound_decay",
+      "count": 10,
+      "topic_count": 1,
+      "style": "spread",
+      "now_ns": 7000000000,
+      "bound_ns": 120000000000,
+      "wait_ns": 113000000000,
+      "ip_score": 0,
+      "service_s": 8.347269039581338
+    }
+  ]
+}

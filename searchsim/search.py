@@ -316,3 +316,251 @@ class Searcher:
                     self.extrapolated = nq * factor
                     self.end_time = horizon
         return self
+
+
+class ForkConfig:
+    """The search values of the fork: topicindex/search.go, searchfilter.go,
+    common.go, v5_topic.go and the v5 response timeout."""
+
+    def __init__(self, search_depth=18, bucket_size=8, ip_limit=1, yield_floor=8, yield_window=4,
+                 max_jump=4, aux_radius=1, pass_queries=32, topic_nodes_limit=16, ad_lifetime=900.0,
+                 mix_registrars=5, mix_wait=5.0, pass_backoff=60.0, resp_timeout=0.7, unread_limit=16,
+                 filter_limit=50000):
+        self.search_depth, self.bucket_size, self.ip_limit = search_depth, bucket_size, ip_limit
+        self.yield_floor, self.yield_window, self.max_jump = yield_floor, yield_window, max_jump
+        self.aux_radius, self.pass_queries = aux_radius, pass_queries
+        self.topic_nodes_limit, self.ad_lifetime = topic_nodes_limit, ad_lifetime
+        self.mix_registrars, self.mix_wait = mix_registrars, mix_wait
+        self.pass_backoff, self.resp_timeout = pass_backoff, resp_timeout
+        self.filter_limit = filter_limit         # searchFilterLimit
+        # searchUnreadLimit: no query while this many results wait unread. The
+        # model's consumer reads every result at once, so it never binds.
+        self.unread_limit = unread_limit
+
+
+class AskedSet:
+    """askedset.go: node -> [first, last] ask; kept an ad lifetime from the
+    first ask, a later ask only moves last. Expired entries are swept at most
+    once a second, so one may outlive the ttl by up to a second."""
+
+    def __init__(self, ttl):
+        self.ttl, self.at = ttl, {}
+        self.expired = 0.0
+
+    def has(self, i, now):
+        self.expire(now)
+        return i in self.at
+
+    def add(self, i, now):
+        self.expire(now)
+        e = self.at.get(i)
+        if e is not None:
+            e[1] = now
+        else:
+            self.at[i] = [now, now]
+
+    def last_asked(self, i, now):
+        self.expire(now)
+        e = self.at.get(i)
+        return e[1] if e is not None else 0.0
+
+    def expire(self, now):
+        if now - self.expired < 1.0 and self.at:
+            return
+        self.expired = now
+        for i in [i for i, e in self.at.items() if now - e[0] >= self.ttl]:
+            del self.at[i]
+
+
+class ForkSearch:
+    """One pass of topicindex.Search (search.go): its own table of
+    search_depth buckets, decoupled from the registration depth."""
+
+    def __init__(self, fc, pop, tid, self_idx, rng, asked, failed, mint=None, ledger=None, net_of=None, m2=False, m2_nets=2, admission_ledger=None):
+        self.fc, self.pop, self.tid, self.me, self.rng = fc, pop, tid, self_idx, rng
+        self.asked, self.failed = asked, failed
+        self.mint, self.ledger, self.net_lookup = mint, ledger, net_of
+        self.m2, self.m2_nets = m2, m2_nets
+        self.admission_ledger = admission_ledger
+        D = fc.search_depth
+        self.new = [set() for _ in range(D)]
+        self.yield_ = [[] for _ in range(D)]
+        self.yield_nets = [[] for _ in range(D)]
+        self.done = [0] * D
+        self.failed_b = [0] * D
+        self.ips = [dict() for _ in range(D)]     # /24 -> nodes of the bucket on it
+        self.net = getattr(pop, "net", None)
+        self.active = self.start = 0
+        self.spare = set()
+        self.spare_used = self.placed = False
+        self.replies = self.ads = 0
+        self.asked_now = set()
+        self.buffer = []
+        self.result_seen = set()
+
+    def set_active(self, i):
+        self.active = max(0, min(i, self.fc.search_depth - 1))
+        self.start = self.active
+
+    def bucket(self, i):
+        if self.mint is not None and i in self.mint:
+            return self.mint[i][0]
+        return bucket_index(self.tid, int(self.pop.ids[i]), self.fc.search_depth)
+
+    def net_of(self, i):
+        if self.mint is not None and i in self.mint:
+            return self.mint[i][1]
+        if self.net_lookup is not None:
+            return self.net_lookup(i)
+        return int(self.net[i]) if self.net is not None else -1
+
+    def active_failed(self):
+        a = self.active
+        return not self.placed and self.done[a] == 0 and self.failed_b[a] > 0
+
+    def active_done(self):
+        a = self.active
+        return self.replies >= self.fc.pass_queries or (not self.new[a] and len(self.yield_[a]) >= 2)
+
+    def is_done(self):
+        if self.buffer:
+            return False
+        if self.active_done():
+            return True
+        if any(self.new):
+            return False
+        return self.spare_used or not self.spare
+
+    def next_pass_bucket(self):
+        last = self.fc.search_depth - 1
+        nxt = self.active
+        if not self.active_done() and not self.placed and not self.active_failed():
+            nxt = min(self.active + 1, last)
+        if self.ads == 0 and nxt == last and self.start == last:
+            return 0
+        return nxt
+
+    def buckets_with_free_space(self):
+        r, D = self.fc.aux_radius, self.fc.search_depth
+        return [256 - i for i in range(max(0, self.active - r), min(D - 1, self.active + r) + 1)
+                if len(self.new[i]) < self.fc.bucket_size]
+
+    def add_nodes(self, src, nodes, now):
+        check = set()
+        for i in nodes:
+            if i == self.me or self.failed.has(i, now):
+                continue
+            if self.ledger is not None and not self.ledger.allows(self.net_of(i), now):
+                continue
+            if self.admission_ledger is not None and not self.admission_ledger.allows(self.net_of(i), i, now):
+                continue
+            b = self.bucket(i)
+            if i in self.asked_now:
+                continue
+            if self.asked.has(i, now):
+                self.spare.add(i)
+                if self.admission_ledger is not None:
+                    self.admission_ledger.record(self.net_of(i), i, now)
+                continue
+            nb = self.new[b]
+            if i in nb or len(nb) >= self.fc.bucket_size:
+                continue
+            if src is not None:
+                if b in check:
+                    continue
+                check.add(b)
+            k = self.net_of(i)
+            if k >= 0:
+                c = self.ips[b].get(k, 0)
+                if c >= self.fc.ip_limit:
+                    continue
+                self.ips[b][k] = c + 1
+            nb.add(i)
+            if self.admission_ledger is not None:
+                self.admission_ledger.record(k, i, now)
+
+    def remove_node(self, i, keep_ip):
+        """keep_ip: the node's /24 stays counted in its bucket for the pass."""
+        b = self.bucket(i)
+        if i in self.new[b]:
+            k = self.net_of(i)
+            if not keep_ip and k >= 0:
+                self.ips[b][k] -= 1
+            self.new[b].discard(i)
+
+    def handle_error(self, i, now):
+        self.replies += 1
+        self.asked_now.add(i)
+        self.failed.add(i, now)
+        self.spare.discard(i)
+        self.failed_b[self.bucket(i)] += 1
+        self.remove_node(i, False)
+
+    def query_target(self, now):
+        if self.active_done():
+            return None
+        D = self.fc.search_depth
+        for d in range(D):
+            for i in (self.active - d, self.active + d):
+                if 0 <= i < D and self.new[i]:
+                    return self.rng.choice(tuple(self.new[i]))
+        if not self.spare_used and self.spare:
+            pick = min(self.spare, key=lambda j: (self.asked.last_asked(j, now), j))
+            self.spare_used = True
+            self.spare.discard(pick)
+            return pick
+        return None
+
+    def observe(self, bi, ads, net=-1):
+        fc = self.fc
+        y, nets = self.yield_[bi], self.yield_nets[bi]
+        y.append(ads)
+        nets.append(net)
+        if len(y) > fc.yield_window:
+            del y[0]
+            del nets[0]
+        if len(y) < 2:
+            return
+        s = sorted(y)
+        lower, upper = s[(len(s) - 1) // 2], s[len(s) // 2]
+        last = fc.search_depth - 1
+        if lower >= fc.topic_nodes_limit:
+            nxt = max(0, bi - 1)
+        elif upper >= fc.yield_floor:
+            nxt = bi
+        elif upper == 0:
+            nxt = min(last, bi + fc.max_jump)
+        else:
+            nxt = min(last, bi + min(int(math.ceil(math.log2(fc.yield_floor / upper))), fc.max_jump))
+        # M2 samples retain the fork's four-reply window. A public reply
+        # may steer only with enough distinct public /24s in that window.
+        # LAN-origin replies are exempt from this extra gate.
+        if self.m2 and net != -1 and len({n for n in nets if n != -1}) < self.m2_nets:
+            return
+        # a helper farther out than the active bucket can only pull the
+        # search out, one closer in can only push it in
+        a, r = self.active, fc.aux_radius
+        if not (a - r <= bi <= a + r or (bi < a and nxt <= bi) or (bi > a and nxt > bi)):
+            return
+        self.active, self.placed = nxt, True
+
+    def add_reply(self, i, results, ads, sent, now, partial=False):
+        """AddReply, or AddPartialReply: a reply cut short by an error is a
+        density sample only when it reaches the floor on its own."""
+        self.replies += 1
+        self.ads += ads
+        self.asked_now.add(i)
+        self.spare.discard(i)
+        b = self.bucket(i)
+        self.done[b] += 1
+        if not partial or sent >= self.fc.yield_floor:
+            self.observe(b, sent, self.net_of(i))
+        self.asked.add(i, now)
+        self.remove_node(i, True)
+        self.add_results(results)
+
+    def add_results(self, nodes):
+        for r in nodes:
+            if r != self.me and r not in self.result_seen:
+                self.result_seen.add(r)
+                self.buffer.append(r)
