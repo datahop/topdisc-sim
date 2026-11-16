@@ -5,9 +5,9 @@ The adaptive topic search has three settings: the yield floor, the aux radius an
 | | |
 |---|---|
 | model | datahop/topdisc-sim, `searchsim.world`, with the aux-node fix |
-| runs | 63 reruns of the first evaluation, 271 runs for the result mixer |
-| size | 30 000 nodes, with 100 000 and 250 000 for scale |
-| selected | floor 8, aux radius 1, back-off 60 s, results mixed over 5 registrars |
+| runs | 63 reruns of the first evaluation, 273 runs for the result mixer |
+| size | 30 000 nodes, with 50 000 for the result mixer and 100 000 and 250 000 for scale |
+| selected | floor 8, aux radius 1, back-off 60 s, results mixed over 10 registrars |
 
 ## Selected values
 
@@ -16,9 +16,9 @@ The adaptive topic search has three settings: the yield floor, the aux radius an
 | Yield floor | 8 | the speed of the default searcher (377 s to 90 % of a topic, default 401 s) with half of its queries; the busiest registrar gets 2 000 queries, against 150 000 with the default searcher | twice the queries of floor 4, which is three times slower |
 | Aux radius | 1 | 13 times fewer queries in a mix of topic sizes, every small topic still found in full | nothing measured |
 | Pass back-off | 60 s | 5 times fewer queries at the busiest registrar | a late joiner in a small topic is found 0.6 s later at the median, 10 s later at the 90th percentile |
-| Result mixer | 5 registrars | a full eclipse of 16 peer slots needs five sybil registrars in a row; 0.15 % of searchers are eclipsed with 20 % sybils, 21.3 % with no rule | six queries to fill 16 slots, against two or three; the first result comes 0.2 to 0.5 s later with the adaptive search |
+| Result mixer | 10 registrars | a full eclipse of 16 peer slots needs ten sybil registrars in a row; with 50 000 nodes and 20 % sybils on 100 /24s, 0.02 % of searchers are eclipsed, against 0.25 % with 5 registrars | the first result comes after 0.60 s, against 0.30 s with 5 registrars |
 
-The first three values are the defaults of go-ethereum PR #144. The fourth is a constant in PR #140. Section 4 gives the conclusions, sections 3.2 to 3.7 the runs behind each value.
+The first three values are go-ethereum defaults. The fourth is a constant in the go-ethereum search filter. Section 4 gives the conclusions, sections 3.2 to 3.7 the runs behind each value.
 
 ## 1. The problem
 
@@ -40,7 +40,7 @@ The aux radius is `SearchAuxRadius`. Every reply to a query carries aux nodes. T
 
 The pass back-off is `SearchPassBackoff`. A pass is one walk through the search table. The gap between passes is 2 s. After a pass that finds nothing new, the gap doubles, up to this limit. A pass that finds a new result sets the gap to 2 s again. Example: a node in a topic of 5 nodes finds the 4 others in the first seconds. Without a back-off it then repeats its pass every 2 s and finds nothing.
 
-The result mixer is a constant in the search filter (`searchMixRegistrars`). The filter keeps the new results of each registrar in a queue of its own. While five registrars have results in their queues, the search hands out one result from each registrar in turn. It hands out the results that are left when the pass ends. No result is lost.
+The result mixer is a constant in the search filter (`searchMixRegistrars`). The filter keeps the new results of each registrar in a queue of its own. While ten registrars have results in their queues, the search hands out one result from each registrar in turn. It also hands out the held results once the first of them has waited 5 s (`searchMixWait`), and the results that are left when the pass ends. No result is lost.
 
 Four more things were tested and need no setting: the number of aux nodes per reply, the size of a search bucket, the number of buckets, and a rule that ends a pass after some replies with nothing new.
 
@@ -54,6 +54,7 @@ Four more things were tested and need no setting: the number of aux nodes per re
 | Crawl mix, connection-driven | 30 000 nodes in 100 topics with the sizes of the 2026-09-18 crawl, half of them registered | every node searches until it has 16 results, for 1 h | 3.2, 3.4 |
 | Crawl mix with late joiners | the same, but 20 % of the registrants start in the search phase | the same | 3.5, 3.6 |
 | Dense topic with sybils | 30 000 nodes, one topic, half of the nodes registered, 20 % of the nodes are sybils | every honest node searches until it has 50 results | 3.7 |
+| Large dense topic with sybils | 50 000 nodes, one topic, all registered, 20 % of the nodes are sybils on 100 /24s | every honest node searches; the starts are spread over 30 s and all searches end at the same time, so a search lasts 90 to 120 s | 3.7 |
 | Scale | 100 000 and 250 000 nodes, one topic | about 1 000 nodes search for 30 min | 3.8 |
 
 Every searcher has one query in flight. The round-trip time is 60 ms. An ad lives for 15 min. The topic size classes of the crawl mix are 1 000 and more nodes, 100 to 999, 10 to 99, and fewer than 10.
@@ -171,9 +172,27 @@ A sybil registrar answers each query with 16 sybil ads. With no protection, one 
 | mixer, 6 registrars | 0.07 % | 6 | 0.4 | 7 | 32 |
 | mixer, 8 registrars | 0.008 % | 8 | 0.5 | 8 | 39 |
 
-The selected rule is the mixer over 5 registrars. It gives about five times fewer full eclipses than the limit of 5, and the registrar load is lower. A search needs six queries to have 16 results, two more than with the limit.
+The mixer over 5 registrars gives about five times fewer full eclipses than the limit of 5, and the registrar load is lower. A search needs six queries to have 16 results, two more than with the limit. Every registrar added to the mixer lowers the eclipses and delays the first result.
 
-The cost of the mixer is the wait for five replies. When fewer than five registrars have results, the results wait until the pass ends.
+The selected value is 10 registrars. A run of 50 000 nodes compared the mixer over 5 and over 10 registrars, with all IP limits applied: one topic, every node registered, 20 % sybils on 100 /24s, a search bucket limit of 2 per /24, at most 10 registrars per /24 in one search, an ad cache of 1 000, a registration table of 18 buckets with 10 registrars each (`K_register`), seed 1. Every honest node searches with floor 8, radius 1 and back-off 60 s. The searches start over 30 s and all end 120 s after the first start, so a search lasts 90 to 120 s.
+
+```
+for m in 5 10; do
+  python -m searchsim.world --cache 1000 --nodes 50000 --topics 1 --fork-faithful \
+    --search-bucket-ip-limit 2 --sybil-frac 0.2 --sybil-nets 100 --w1p --w1p-limit 10 \
+    --search-time 120 --seed 1 --reg-bucket-size 10 --depth 18 \
+    --fork-mix-registrars $m --out runs/mix$m-n50k/
+done
+```
+
+| Mixer | First 16 results all sybil | Sybil share of first 16, mean | Sybil share of all results, mean | Recall at the end, median | First result, median (s) |
+|---|---|---|---|---|---|
+| 5 registrars | 0.25 % | 38.5 % | 62.7 % | 20.2 % | 0.30 |
+| 10 registrars | 0.02 % | 41.3 % | 62.7 % | 20.2 % | 0.60 |
+
+With 10 registrars about ten times fewer searchers get only sybils in their first 16 results. Recall, the sybil share of all results, the queries and the registrar load stay the same. The mean sybil share of the first 16 rises by 3 points. The first result comes 0.3 s later. A full eclipse takes all 16 outbound peer slots of a node, and a delay of 0.3 s is small against that.
+
+The cost of the mixer is the wait for its replies. When fewer registrars have results, the results wait until the pass ends or until the first of them has waited 5 s. The times by topic size below are for the mixer over 5 registrars, in runs without the 5 s wait.
 
 | Topic size | First result, adaptive search: limit 5 / mixer 5 (s) | First result, default searcher: limit 5 / mixer 5 (s) |
 |---|---|---|
@@ -214,17 +233,17 @@ The load of the busiest registrar stays below 2 000 queries at every size with t
 1. Use floor 8. Floors 2 and 4 are three times slower to 90 % of a topic than the default searcher, and no searcher finds 99 % with them. Floor 8 is as fast as the default searcher and sends half of its queries. Floor 12 gives the same result as floor 8.
 2. Use aux radius 1. It reduces the queries in the crawl mix from 35.4 million to 2.7 million. Every topic with fewer than 10 nodes is still found in full.
 3. Use a pass back-off of 60 s. The busiest registrar gets 565 queries in place of 2 806. A limit of 300 s reduces the load more but slows the small topics, from 321 s to 510 s to 90 %.
-4. Mix the results of 5 registrars. With 20 % sybils and a /24 for each sybil, 0.15 % of the searchers get 16 sybil results. A limit of 5 results per registrar gives 0.69 %. The mixer costs two more queries before a search has 16 results. With the default searcher a topic with fewer than 10 nodes gets its first result after 4.2 s, against 1.4 s.
+4. Mix the results of 10 registrars. With 50 000 nodes, 20 % sybils on 100 /24s and all IP limits, 0.02 % of the searchers get 16 sybil results, against 0.25 % with 5 registrars, and the first result comes after 0.60 s, against 0.30 s. With 30 000 nodes and a /24 for each sybil, the mixer over 5 registrars gives 0.15 % and a limit of 5 results per registrar 0.69 %. There the mixer over 5 costs two more queries before a search has 16 results, and with the default searcher a topic with fewer than 10 nodes gets its first result after 4.2 s, against 1.4 s.
 5. Do not change the aux nodes per reply, the bucket size or the number of buckets. They have no effect.
 6. Do not add the rule that ends a pass early. It breaks small topics with the default searcher.
 7. Two conclusions of the first evaluation were wrong because of the model defect: that floors 2 to 12 are equal, and that radius 1 breaks small topics.
 
 | Setting | First evaluation | Now | Reason | Where |
 |---|---|---|---|---|
-| Yield floor | 4 | 8 | floors 2 and 4 are three times slower to 90 % with the fixed model | default in go-ethereum PR #144 |
-| Aux radius | every bucket | 1 | 13 times fewer queries in the crawl mix, small topics complete | default in PR #144 |
-| Pass back-off | 2 s, fixed | up to 60 s | busiest registrar 5 times lower, late joiners 0.6 s later | default in PR #144 |
-| Result mixer | none | 5 registrars | five sybil registrars in a row for a full eclipse, six queries to 16 results | constant in PR #140 |
+| Yield floor | 4 | 8 | floors 2 and 4 are three times slower to 90 % with the fixed model | go-ethereum default |
+| Aux radius | every bucket | 1 | 13 times fewer queries in the crawl mix, small topics complete | go-ethereum default |
+| Pass back-off | 2 s, fixed | up to 60 s | busiest registrar 5 times lower, late joiners 0.6 s later | go-ethereum default |
+| Result mixer | none | 10 registrars | ten sybil registrars in a row for a full eclipse, ten times fewer eclipses than 5 registrars, first result 0.3 s later | constant in go-ethereum |
 | Aux nodes per reply, bucket size, buckets | 8, 16, 10 | no change | no effect | |
 
 ## 5. Limits
@@ -232,6 +251,7 @@ The load of the busiest registrar stays below 2 000 queries at every size with t
 - No model run has floor 8, radius 1 and back-off 60 s together in the one-topic continuous scenario. The runs of section 3.7 use the three values together, in the dense topic and in the crawl mix.
 - The 100 000 and 250 000 node runs use floor 4. Floor 8 at these sizes is open.
 - The model has one query in flight for each searcher, a fixed round-trip time and no packet loss.
-- The mixer holds results until the pass ends when fewer than five registrars have results. A pass of the default searcher takes about 10 s in the model.
+- When fewer than ten registrars have results, the mixer holds them until the pass ends or until the first has waited 5 s. A pass of the default searcher takes about 10 s in the model. The 30 000-node mixer runs have no 5 s wait, so their first-result times for the default searcher are an upper bound.
+- The comparison of 5 and 10 registrars is one run with one seed and one large topic. The first result by topic size is measured for 5 registrars only.
 - The sybils of section 3.7 that share a /24 are a model of the IP limits in the tables. On a network with private addresses these limits do not run.
 - The simnet run of 2026-10-01 (7 500 nodes) and the first AWS run of 2026-10-02 (858 nodes) use floor 8, radius 1 and back-off 60 s on the Go code. They use the limit rule, not the mixer.
