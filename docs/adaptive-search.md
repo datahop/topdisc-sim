@@ -2,7 +2,7 @@
 
 The topic search as implemented has a load problem. One rule in the searcher fixes it. This document describes both and shows what the Python model of TopDisc measures at 30 000, 100 000 and 250 000 nodes. No testbed can run those sizes.
 
-All numbers and figures come from the model with the aux-node fix (PR #2). The first version of this document used the model before that fix, and two of its conclusions changed: the rule now costs search time at every size with floor 4, and floor 4 is no longer the selected value. The runs here use floor 4 and aux nodes for every bucket, as before. [adaptive-search-parameters.md](adaptive-search-parameters.md) selects the values now in go-ethereum: floor 8, aux radius 1, a 60 s pass back-off and results mixed over 5 registrars.
+All numbers and figures come from the model with the aux-node fix (PR #2). The first version of this document used the model before that fix, and two of its conclusions changed: the rule now costs search time at every size with floor 4, and floor 4 is no longer the selected value. The runs here use floor 4 and aux nodes for every bucket, as before. [adaptive-search-parameters.md](adaptive-search-parameters.md) selects the values now in go-ethereum: floor 8, aux radius 1, a 60 s pass back-off and results mixed over 10 registrars.
 
 | | |
 |---|---|
@@ -149,7 +149,7 @@ On the mix the busiest registrar comes down nine times and the p99 3.6 times. La
 
 - With floor 4 the rule costs search time at every size, in the fixed model as on real nodes. A higher floor removes that cost: floor 8 is as fast as the default at 30k with half its queries.
 
-- Selected values (adaptive-search-parameters.md): yield floor 8, aux radius 1, a 60 s pass back-off, results mixed over 5 registrars. The residual skew is the routing-table bias.
+- Selected values (adaptive-search-parameters.md): yield floor 8, aux radius 1, a 60 s pass back-off, results mixed over 10 registrars. The residual skew is the routing-table bias.
 
 ## Sources
 
