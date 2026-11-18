@@ -8,7 +8,26 @@ with sybil ads only and refer sybils as aux nodes. Per honest searcher the
 model records the share of sybils among its results and whether it was
 eclipsed: every one of its 16 slots a sybil.
 
-## One topic: eclipse rate against the sybil population
+## Decision
+
+The search hands out its results through a mixer over 10 registrars
+(`--fork-mix-registrars 10`): it waits until 10 registrars have results, then
+takes one from each in turn, so no single registrar fills a node's 16 slots.
+On top of it the search keeps at most 2 registrars per /24 in a bucket and at
+most 10 registrars per /24 in one search. With these settings:
+
+- Sybil registrars, 50 000 nodes, 20 % sybils on 100 /24s: 0.02 % of searchers
+  get only sybils in their first 16 results, against 0.25 % with the mixer
+  over 5 ([adaptive-search-parameters.md §3.7](adaptive-search-parameters.md#37-result-mixer)).
+- Sybil advertisers flooding a topic or occupying the cache: no searcher
+  eclipsed, honest recall 100 % ([capacity.md](capacity.md#results)).
+- The A3 attack below is stopped by the per-search /24 limit, not by the mixer.
+
+The first three tables were run before the mixer existed: one reply could
+fill all 16 slots. They show why a rule is needed and what the reply cap
+would have cost.
+
+## One topic: eclipse rate against the sybil population (pre-mixer)
 
 | rule | eclipsed at 5 / 10 / 20 % sybils | mean sybil share of results at 10 / 20 % | queries per node |
 |---|---|---|---|
@@ -26,7 +45,7 @@ searchers take two queries and the first decides. A sybil registrar still
 fills 6 of 16 slots, which is where the median share of 0.375 at 20 % comes
 from; a cap of 4 would need four sources.
 
-## Crawl mix: eclipse by topic size
+## Crawl mix: eclipse by topic size (pre-mixer)
 
 10 % sybils over the 100 crawl topics (`models/crawl-2026-09-18.json`).
 
@@ -51,7 +70,7 @@ sybil a distinct address; the per-/24 limits on aux nodes that the
 implementation has would blunt the referral channel for an attacker with few
 prefixes.
 
-## What the reply cap costs
+## What the reply cap costs (pre-mixer)
 
 | workload, 30 000 nodes | 16 ads per reply | 6 ads per reply |
 |---|---|---|
@@ -78,7 +97,7 @@ The service-discovery paper prescribes N_return = 10 results per registrar
 against N_lookup = 30 needed and K_lookup = 5 registrars queried in parallel,
 so no registrar can fill a lookup alone. The implementation lost that:
 both limits are 16 and one query is in flight, so one reply fills a
-connection-driven node. Either defence above restores the property.
+connection-driven node. The mixer over 10 registrars restores the property.
 
 ## IP limits per search
 
@@ -86,39 +105,45 @@ The search table is rebuilt every pass, so a per-bucket /24 limit has no memory:
 holding a few /24s can place a fresh sybil ID in every bucket on every pass. Here the attacker
 holds 2 /24s, and its registrars answer with no advertisements until the search reaches the
 closest bucket, then with 11 useless ones, and refer other sybils as auxiliary ENRs for the
-closest buckets (`--attack A3`). 30,000 nodes, honest addresses from the 24 h mainnet crawl
-(`--honest-nets crawl`), 918 searchers, one seed. The limits compared are 2 registrars per /24
-in a bucket (`--search-bucket-ip-limit 2`) and at most N distinct node IDs per /24 in one
-search, each counted for one ad lifetime (`--w1p --w1p-limit N`).
+closest buckets (`--attack A3`). 30,000 nodes, all registered, one topic per crawl chain (455
+topics), honest addresses from the 24 h mainnet crawl (`--honest-nets crawl`), 3 % of nodes
+searching for 2,700 s (918 searchers), mixer over 10 registrars, one seed. The limits compared
+are 2 registrars per /24 in a bucket (`--search-bucket-ip-limit 2`) and at most N distinct node
+IDs per /24 in one search, each counted for one ad lifetime (`--w1p --w1p-limit N`). Sybil share
+is the mean share of sybils among a pass's queries; recall, the searchers reaching 90 % and t90
+count honest providers only.
 
 Under the attack:
 
 | Limits | Sybil share of queries | Passes with no honest query | Recall | Searchers reaching 90 % | Mean t90 |
 |---|---:|---:|---:|---:|---:|
-| 1 per bucket, none per search | 92.8 % | 1,120,044 | 97.3 % | 858 / 918 | 1,120 s |
-| 2 per bucket, none per search | 92.1 % | 1,117,039 | 73.2 % | 557 / 918 | 1,267 s |
-| 2 per bucket, 10 per search | 0.63 % | 1,344 | 100 % | 918 / 918 | 132 s |
+| 1 per bucket, none per search | 93.6 % | 1,129,336 | 96.6 % | 838 / 918 | 1,209 s |
+| 2 per bucket, none per search | 92.2 % | 1,119,025 | 72.0 % | 534 / 918 | 1,219 s |
+| 2 per bucket, 10 per search | 0.65 % | 1,614 | 100 % | 918 / 918 | 136 s |
 
-With no attack, the limits of 2 per bucket and 10 per search raise the mean t90 from 104.6 s to
-123.9 s, with recall at 100 %. Per-search limits of 1 and 2 also stop the attack, with a sybil
-share of 0.07 % and 0.13 %, but raise the mean t90 with no attack to 273 s and 175 s. The
-attacker's allowance grows by 10 with each further /24.
+The mixer changes these numbers little: A3 does not need one reply to fill the slots, it takes
+the search's queries pass after pass. The per-search limit stops it. Without the
+mixer the same three rows gave a sybil share of 92.8 %, 92.1 % and 0.63 %. With no attack, the
+limits of 2 per bucket and 10 per search raise the mean t90 from 104.6 s to 123.9 s, with recall
+at 100 % (pre-mixer runs). Per-search limits of 1 and 2 also stop the attack, with a sybil share
+of 0.07 % and 0.13 %, but raise the mean t90 with no attack to 273 s and 175 s (pre-mixer runs).
+The attacker's allowance grows by 10 with each further /24.
+
+`MODEL` is the chain model: one topic per crawl chain, with the chain's share of nodes.
 
 ```sh
-python3 -m searchsim.world --nodes 30000 --fork-faithful --honest-nets crawl --attack A3 \
-  --attack-nets 2 --search-bucket-ip-limit 2 --w1p --w1p-limit 10 --seed 1 --out runs/a3-w1p10/
+python3 -m searchsim.world --nodes 30000 --topics 455 --model MODEL --all-register --target 0 \
+  --search-frac .03 --search-time 2700 --fork-faithful --honest-nets crawl \
+  --fork-mix-registrars 10 --attack A3 --attack-nets 2 --search-bucket-ip-limit 2 \
+  --w1p --w1p-limit 10 --seed 1 --out runs/a3-w1p10/
 ```
 
-## Decision needed
+## Why the mixer and not the reply cap
 
-Two ways to get the cube: cap the reply at the registrar (`topicNodesResultLimit`
-6, no consumer change, the cost above) or keep 16 per reply and have the
-search iterator interleave results so that no 16 consecutive results come from
-one registrar (consumer side, keeps the tail, needs source tracking in the
-iterator). The referral channel stays open in both; the per-/24 aux limit is
-the next lever there. Not evaluated here: the admission IP-diversity score against
-a sybil cluster on one prefix (the model's IP term was zero for these runs;
-`world` now applies the 703d5a2 rule with the IP term, see `capacity.md`).
+Both get the cube. The reply cap of 6 needs no consumer change but costs continuous searchers
+the tail of large topics (above). The mixer keeps 16 ads per reply and the tail, and interleaves
+at the consumer, which tracks the source of each result. The referral channel is open in both;
+the per-/24 limits of the search close it for an attacker with few prefixes.
 
-Runs: `runs/sybil`, `runs/sybil3`, `runs/cap6`, `runs/sybilmix` on London,
+Pre-mixer runs: `runs/sybil`, `runs/sybil3`, `runs/cap6`, `runs/sybilmix` on London,
 `python3 -m searchsim.world --sybil-frac ... --topic-nodes-limit ... --min-sources ... --min-buckets ...`.
